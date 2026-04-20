@@ -1637,6 +1637,26 @@ void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &si
 		return;
 	}
 
+	vector<idx_t> build_partition_sizes(num_partitions, 0);
+	vector<idx_t> build_partition_counts(num_partitions, 0);
+	idx_t dummy_max_size, dummy_max_count;
+	ht.GetTotalSize(build_partition_sizes, build_partition_counts, dummy_max_size, dummy_max_count);
+
+	vector<idx_t> probe_partition_counts;
+	sink.probe_spill->GetPartitionCounts(probe_partition_counts);
+	if (probe_partition_counts.size() < num_partitions) {
+		probe_partition_counts.resize(num_partitions, 0);
+	}
+
+	const auto reservation = sink.temporary_memory_state->GetReservation();
+	D_ASSERT(reservation >= sink.probe_side_requirement);
+	const idx_t build_memory_budget = reservation - sink.probe_side_requirement;
+
+	idx_t active_build_total_size = 0;
+	idx_t active_build_max_size = 0;
+	idx_t active_build_data_size = 0;
+	idx_t active_build_count = 0;
+
 	// ── Evaluate each active partition ─────────────────────────────────────
 	const auto &current_partitions_mask = ht.GetCurrentPartitions();
 	for (idx_t p = 0; p < num_partitions; p++) {
@@ -1644,28 +1664,43 @@ void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &si
 			// Partition already finished or not active this round
 			continue;
 		}
-		// Build-side size for partition p (bytes already materialized in the HT)
-		// GetTotalSize() fills partition_sizes[p] with the TupleData size.
-		// We use a local vector here for simplicity; a cached version is fine too.
-		vector<idx_t> build_partition_sizes(num_partitions, 0);
-		vector<idx_t> build_partition_counts(num_partitions, 0);
-		idx_t dummy_max_size, dummy_max_count;
-		ht.GetTotalSize(build_partition_sizes, build_partition_counts, dummy_max_size, dummy_max_count);
 		const idx_t build_size = build_partition_sizes[p] + ht.PointerTableSize(build_partition_counts[p]);
-		// Probe-side size: read from the ColumnDataConsumer's partition info.
-		// The consumer exposes per-partition chunk counts, not byte sizes directly.
-		// A reasonable proxy is: chunks * STANDARD_VECTOR_SIZE * avg_tuple_width.
-		// For a first-pass decision, chunk count is sufficient as a relative measure.
-		//
-		// NOTE: For a more accurate measure, Task 2 can pass real byte sizes.
-		//       Here we use chunk count as a lightweight heuristic.
-		const idx_t probe_chunks =
-		    sink.probe_spill->consumer->Count() == 0 ? 0 : sink.probe_spill->consumer->ChunkCount();
-		// (probe_chunks is total, not per-partition — a per-partition API is a
-		//  Task 2/3 refinement; for logging purposes this is sufficient.)
-		const idx_t probe_size_proxy = probe_chunks; // intentional proxy
-		// Decision: swap if build side is larger than probe side
-		const bool should_swap = build_size > probe_size_proxy;
+		active_build_total_size += build_size;
+		active_build_max_size = MaxValue(active_build_max_size, build_size);
+		active_build_data_size += build_partition_sizes[p];
+		active_build_count += build_partition_counts[p];
+	}
+
+	for (idx_t p = 0; p < num_partitions; p++) {
+		if (!current_partitions_mask.RowIsValidUnsafe(p)) {
+			continue;
+		}
+
+		const idx_t build_count = build_partition_counts[p];
+		const idx_t build_data_size = build_partition_sizes[p];
+		const idx_t build_size = build_data_size + ht.PointerTableSize(build_count);
+
+		const auto per_partition_build_row_width =
+		    build_count == 0 ? 0.0 : static_cast<double>(build_data_size) / static_cast<double>(build_count);
+		const auto active_build_row_width =
+		    active_build_count == 0 ? 0.0 : static_cast<double>(active_build_data_size) / static_cast<double>(active_build_count);
+		const auto assumed_probe_row_width =
+		    per_partition_build_row_width == 0.0 ? active_build_row_width : per_partition_build_row_width;
+
+		const idx_t probe_count = probe_partition_counts[p];
+		const idx_t probe_data_estimate = static_cast<idx_t>(static_cast<double>(probe_count) * assumed_probe_row_width);
+		const idx_t probe_size = probe_data_estimate + ht.PointerTableSize(probe_count);
+
+		const auto partition_share =
+		    active_build_total_size == 0 ? 0.0 : static_cast<double>(build_size) / static_cast<double>(active_build_total_size);
+		const bool is_skewed_partition =
+		    build_size == active_build_max_size && partition_share > SKEW_SINGLE_THREADED_THRESHOLD;
+		const bool is_memory_insufficient = build_size > build_memory_budget;
+		const bool probe_reduces_memory = probe_size < build_size;
+		const bool probe_fits_memory = probe_size <= build_memory_budget;
+
+		const bool should_swap =
+		    is_skewed_partition && is_memory_insufficient && probe_reduces_memory && probe_fits_memory;
 		if (should_swap) {
 			sink.partition_swapped[p] = true;
 			sink.current_round_has_swapped = true;
@@ -1673,7 +1708,13 @@ void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &si
 		DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
 		           {{"partition", to_string(p)},
 		            {"build_size_bytes", to_string(build_size)},
-		            {"probe_chunks_proxy", to_string(probe_size_proxy)},
+		            {"probe_size_estimated_bytes", to_string(probe_size)},
+		            {"probe_count", to_string(probe_count)},
+		            {"assumed_probe_row_width", to_string(assumed_probe_row_width)},
+		            {"build_partition_share", to_string(partition_share)},
+		            {"is_skewed_partition", is_skewed_partition ? "true" : "false"},
+		            {"is_memory_insufficient", is_memory_insufficient ? "true" : "false"},
+		            {"build_memory_budget_bytes", to_string(build_memory_budget)},
 		            {"decision", should_swap ? "SWAP" : "no_swap"}});
 	}
 	DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
