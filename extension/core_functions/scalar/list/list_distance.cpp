@@ -34,11 +34,11 @@ static void ListGenericFold(DataChunk &args, ExpressionState &state, Vector &res
 	D_ASSERT(lhs_child.GetVectorType() == VectorType::FLAT_VECTOR);
 	D_ASSERT(rhs_child.GetVectorType() == VectorType::FLAT_VECTOR);
 
-	if (!FlatVector::Validity(lhs_child).CheckAllValid(lhs_count)) {
+	if (!FlatVector::ValidityMutable(lhs_child).CheckAllValid(lhs_count)) {
 		throw InvalidInputException("%s: left argument can not contain NULL values", func_name);
 	}
 
-	if (!FlatVector::Validity(rhs_child).CheckAllValid(rhs_count)) {
+	if (!FlatVector::ValidityMutable(rhs_child).CheckAllValid(rhs_count)) {
 		throw InvalidInputException("%s: right argument can not contain NULL values", func_name);
 	}
 
@@ -61,10 +61,6 @@ static void ListGenericFold(DataChunk &args, ExpressionState &state, Vector &res
 
 		    return OP::Operation(lhs_data + left.offset, rhs_data + right.offset, left.length);
 	    });
-
-	if (args.AllConstant()) {
-		result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	}
 }
 
 //-------------------------------------------------------------------------
