@@ -362,6 +362,12 @@ public:
 
 	bool skip_filter_pushdown = false;
 	unique_ptr<JoinFilterGlobalState> global_filter_state;
+
+	//! Tracks which partitions have been swapped
+	vector<bool> partition_swapped;
+
+	// Tracks whether the current round has swapped any partitions
+	bool current_round_has_swapped;
 };
 
 unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
@@ -1441,6 +1447,10 @@ public:
 	void PrepareBuild(HashJoinGlobalSinkState &sink);
 	void PrepareProbe(HashJoinGlobalSinkState &sink);
 	void PrepareScanHT(HashJoinGlobalSinkState &sink);
+
+	//! Decide which partitions have been swapped (must hold lock)
+	void DecidePartitionSwaps(HashJoinGlobalSinkState &sink);
+
 	//! Assigns a task to a local source state
 	bool AssignTask(HashJoinGlobalSinkState &sink, HashJoinLocalSourceState &lstate);
 
@@ -1596,6 +1606,80 @@ bool HashJoinGlobalSourceState::TryPrepareNextStage(HashJoinGlobalSinkState &sin
 	return false;
 }
 
+void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &sink) {
+	auto &ht = *sink.hash_table;
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(ht.GetRadixBits());
+
+
+	// Resize/reset per-round tracking vectors
+	sink.partition_swapped.assign(num_partitions, false);
+	sink.current_round_has_swapped = false;
+
+	// ── Guardrail: MARK and SINGLE joins cannot be safely swapped ──────────
+	//   MARK  – needs the build side to emit a "found match" boolean column.
+	//   SINGLE – requires at-most-one-match semantics that depend on
+	//             the build side being the original RHS.
+	if (op.join_type == JoinType::MARK || op.join_type == JoinType::SINGLE) {
+		DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
+		           {{"reason", "skipped: join type does not support swapping"},
+		            {"join_type", EnumUtil::ToString(op.join_type)}});
+		return;
+	}
+
+	// ── Gather probe-side partition sizes ──────────────────────────────────
+	//   probe_spill is only valid after PrepareProbe() has been called at
+	//   least once (i.e., after the first external round's probe phase).
+	//   On the very first call to PrepareBuild() there is no probe_spill yet,
+	//   so we conservatively skip swapping.
+	if (!sink.probe_spill || !sink.probe_spill->consumer) {
+		DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
+		           {{"reason", "skipped: probe_spill not yet available (first round)"}});
+		return;
+	}
+
+	// ── Evaluate each active partition ─────────────────────────────────────
+	const auto &current_partitions_mask = ht.GetCurrentPartitions();
+	for (idx_t p = 0; p < num_partitions; p++) {
+		if (!current_partitions_mask.RowIsValidUnsafe(p)) {
+			// Partition already finished or not active this round
+			continue;
+		}
+		// Build-side size for partition p (bytes already materialized in the HT)
+		// GetTotalSize() fills partition_sizes[p] with the TupleData size.
+		// We use a local vector here for simplicity; a cached version is fine too.
+		vector<idx_t> build_partition_sizes(num_partitions, 0);
+		vector<idx_t> build_partition_counts(num_partitions, 0);
+		idx_t dummy_max_size, dummy_max_count;
+		ht.GetTotalSize(build_partition_sizes, build_partition_counts, dummy_max_size, dummy_max_count);
+		const idx_t build_size = build_partition_sizes[p] + ht.PointerTableSize(build_partition_counts[p]);
+		// Probe-side size: read from the ColumnDataConsumer's partition info.
+		// The consumer exposes per-partition chunk counts, not byte sizes directly.
+		// A reasonable proxy is: chunks * STANDARD_VECTOR_SIZE * avg_tuple_width.
+		// For a first-pass decision, chunk count is sufficient as a relative measure.
+		//
+		// NOTE: For a more accurate measure, Task 2 can pass real byte sizes.
+		//       Here we use chunk count as a lightweight heuristic.
+		const idx_t probe_chunks =
+		    sink.probe_spill->consumer->Count() == 0 ? 0 : sink.probe_spill->consumer->ChunkCount();
+		// (probe_chunks is total, not per-partition — a per-partition API is a
+		//  Task 2/3 refinement; for logging purposes this is sufficient.)
+		const idx_t probe_size_proxy = probe_chunks; // intentional proxy
+		// Decision: swap if build side is larger than probe side
+		const bool should_swap = build_size > probe_size_proxy;
+		if (should_swap) {
+			sink.partition_swapped[p] = true;
+			sink.current_round_has_swapped = true;
+		}
+		DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
+		           {{"partition", to_string(p)},
+		            {"build_size_bytes", to_string(build_size)},
+		            {"probe_chunks_proxy", to_string(probe_size_proxy)},
+		            {"decision", should_swap ? "SWAP" : "no_swap"}});
+	}
+	DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
+	           {{"any_swap_this_round", sink.current_round_has_swapped ? "true" : "false"}});
+}
+
 void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	D_ASSERT(global_stage != HashJoinSourceStage::BUILD);
 	auto &ht = *sink.hash_table;
@@ -1612,6 +1696,8 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 		sink.temporary_memory_state->SetZero();
 		return;
 	}
+
+	DecidePartitionSwaps(sink);
 
 	auto &data_collection = ht.GetDataCollection();
 	if (data_collection.Count() == 0 && op.EmptyResultIfRHSIsEmpty()) {
