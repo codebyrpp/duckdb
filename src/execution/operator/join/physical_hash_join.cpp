@@ -1638,8 +1638,8 @@ void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &si
 
     vector<idx_t> build_partition_sizes(num_partitions, 0);
     vector<idx_t> build_partition_counts(num_partitions, 0);
-    idx_t dummy_max_size, dummy_max_count;
-    ht.GetTotalSize(build_partition_sizes, build_partition_counts, dummy_max_size, dummy_max_count);
+    // FIX: Explicitly extract the sizes and counts from the HT's sink collection
+    ht.GetSinkCollection().GetSizesAndCounts(build_partition_sizes, build_partition_counts);
 
     vector<idx_t> probe_partition_counts;
     sink.probe_spill->GetPartitionCounts(probe_partition_counts);
@@ -1658,8 +1658,6 @@ void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &si
 
     idx_t active_build_total_size = 0;
     idx_t active_build_max_size = 0;
-    idx_t active_build_data_size = 0;
-    idx_t active_build_count = 0;
 
     // ── Evaluate each active partition ─────────────────────────────────────
     const auto &current_partitions_mask = ht.GetCurrentPartitions();
@@ -1668,21 +1666,13 @@ void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &si
             // Partition already finished or not active this round
             continue;
         }
-        const idx_t build_size = build_partition_sizes[p] + ht.PointerTableSize(build_partition_counts[p]);
-        active_build_total_size += build_size;
-        active_build_max_size = MaxValue(active_build_max_size, build_size);
-        active_build_data_size += build_partition_sizes[p];
-        active_build_count += build_partition_counts[p];
-    }
-
-    for (idx_t p = 0; p < num_partitions; p++) {
-        if (!current_partitions_mask.RowIsValidUnsafe(p)) {
-            continue;
-        }
 
         const idx_t build_count = build_partition_counts[p];
         const idx_t build_data_size = build_partition_sizes[p];
         const idx_t build_size = build_data_size + ht.PointerTableSize(build_count);
+        active_build_total_size += build_size;
+        active_build_max_size = MaxValue(active_build_max_size, build_size);
+
 
         const idx_t probe_count = probe_partition_counts[p];
 
